@@ -1,3 +1,7 @@
+# ITEM-reproduction
+北航课程大作业仓库，包含复现所需代码
+>>>>>>> f77c17c365ea9a179c116c9346dbc564837c670a
+
 # An Iterative Utility Judgment Framework Inspired by Philosophical Relevance via LLMs
 This is the official repo for the paper "An Iterative Utility Judgment Framework Inspired by Philosophical Relevance via LLMs".  
 
@@ -22,5 +26,4 @@ Taking the testing of Mistral-7B as an example, we demonstrated the use of four 
 python mistral/item-As-ImpA.py
 
 ```
-
 
