@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""
+ITEM 论文复现 — 统一评估脚本（Qwen3-8B-GPTQ, TREC + WebAP）
+用法：cd ITEM-main && python metrics/evaluate_all.py
+输出：metrics/evaluation_results.xlsx（每类实验一个 Sheet）
+"""
+
+import json
+import os
+import re
+import sys
+sys.path.append(".")
+
+from openpyxl import Workbook
+from collections import defaultdict
+
+# ── 工具函数 ──────────────────────────────────────────────
+
+def extract_numbers(text):
+    return re.findall(r'\d+', text)
+
+def extract_substrings(input_string):
+    return ''.join(re.findall(r'\[\d+\]', input_string))
+
+def clean_response(sp: str):
+    """从模型原始输出中提取 passage 编号"""
+    response = extract_substrings(sp.lower())
+    if len(response) == 0:
+        response = extract_numbers(sp.lower())
+        return [int(r) for r in response if 1 <= int(r) <= 20]
+    return response  # 返回字符串，后续按需 split
+
+def clean_response_to_indices(sp: str, max_len=20):
+    """将模型输出转化为 0-based 索引列表"""
+    response = extract_substrings(sp.lower())
+    if len(response) == 0:
+        response = extract_numbers(sp.lower())
+        indices = [int(r)-1 for r in response if 1 <= int(r) <= max_len]
+    else:
+        indices = [int(c)-1 for c in re.findall(r'\d+', response) if 1 <= int(c) <= max_len]
+    seen = set()
+    return [x for x in indices if not (x in seen or seen.add(x))]
+
+def get_ground_truth_indices(labels, max_label=3):
+    """从标签列表中提取真正相关的 passage 索引"""
+    return [i for i, lbl in enumerate(labels) if lbl >= max_label]
+
+def compute_pre_rec_f1(selected, ground_truth):
+    """Precision, Recall, F1"""
+    if len(selected) == 0:
+        return 0.0, 0.0, 0.0
+    if len(ground_truth) == 0:
+        return 0.0, 0.0, 0.0
+    tp = len([x for x in selected if x in ground_truth])
+    pre = tp / len(selected)
+    rec = tp / len(ground_truth)
+    f1 = 2 * pre * rec / (pre + rec) if (pre + rec) > 0 else 0.0
+    return pre, rec, f1
+
+def compute_pointwise_pre_rec_f1(model_label, ground_truth_label, max_label=3):
+    """Pointwise: model_label 和 ground_truth_label 都是 0/1 列表"""
+    gt_binary = [1 if lbl >= max_label else 0 for lbl in ground_truth_label]
+    tp = sum(1 for m, g in zip(model_label, gt_binary) if m == 1 and g == 1)
+    pre = tp / sum(model_label) if sum(model_label) > 0 else 0.0
+    rec = tp / sum(gt_binary) if sum(gt_binary) > 0 else 0.0
+    f1 = 2 * pre * rec / (pre + rec) if (pre + rec) > 0 else 0.0
+    return pre, rec, f1
+
+
+# ── 评估函数 ──────────────────────────────────────────────
+
+def evaluate_single_shot(file_path, max_label=3):
+    """
+    单次推理（Step 1: single-shot-utility-judgmentspy.py）
+    - Listwise: LLM_output_all 是单一字符串，含 "My selection: [[i],[j],...]"
+    - Pointwise: LLM_output_all 是 list of strings，每个 passage 独立判断
+      此时改用 model_out_label（推理脚本已正确设置 0/1）
+    """
+    pres, recs, f1s = [], [], []
+    n_total = 0
+    for line in open(file_path, 'r', encoding='utf-8'):
+        js = json.loads(line)
+        raw = js.get("LLM_output_all", "")
+        if isinstance(raw, str):
+            selected = clean_response_to_indices(raw)
+        else:
+            # pointwise: raw 是 list of strings（每个 passage 的 LLM 输出）
+            # 原始代码 v == 1 永远为 false（字符串 != 整数），
+            # 改用 model_out_label（推理脚本已正确计算 0/1）
+            model_labels = js.get("model_out_label", [])
+            if model_labels:
+                selected = [i for i, v in enumerate(model_labels) if v == 1]
+            else:
+                # 兜底：解析每个字符串中的 yes/no
+                selected = [i for i, v in enumerate(raw) if isinstance(v, str) and 'yes' in v.lower()]
+        gt = get_ground_truth_indices(js.get("ground_truth_label", []), max_label)
+        pre, rec, f1 = compute_pre_rec_f1(selected, gt)
+        pres.append(pre)
+        recs.append(rec)
+        f1s.append(f1)
+        n_total += 1
+    if n_total == 0:
+        return 0, 0, 0, 0
+    return (100*sum(pres)/n_total, 100*sum(recs)/n_total,
+            100*sum(f1s)/n_total, n_total)
+def evaluate_item_as(file_path, dataset, max_label=3):
+    """
+    ITEM-As listwise / pointwise (Steps 2-4)
+    LLM_output_all 是 0/1 列表（最终轮次的选择结果）
+    ground_truth_label 是原始标签列表
+    同时输出逐轮迭代指标
+    """
+    pres, recs, f1s = [], [], []
+    iter_metrics = defaultdict(lambda: {"pre": [], "rec": [], "f1": []})
+    n_total = 0
+    for line in open(file_path, 'r', encoding='utf-8'):
+        js = json.loads(line)
+        # 最终轮次
+        final_label = js.get("LLM_output_all", [])
+        gt = js.get("ground_truth_label", [])
+        if isinstance(gt, list) and len(gt) > 0 and isinstance(gt[0], list):
+            # ground_truth_label 是 list of lists（迭代的）
+            gt = gt[-1]  # 最后一轮
+        pre, rec, f1 = compute_pointwise_pre_rec_f1(final_label, gt, max_label)
+        pres.append(pre)
+        recs.append(rec)
+        f1s.append(f1)
+        n_total += 1
+
+        # 逐轮迭代指标
+        model_out_labels = js.get("model_out_labels", [])
+        for r, round_label in enumerate(model_out_labels):
+            r_gt = gt
+            if isinstance(js.get("ground_truth_label", []), list) and len(js.get("ground_truth_label", [])) > 0:
+                if isinstance(js["ground_truth_label"][0], list):
+                    idx = min(r, len(js["ground_truth_label"])-1)
+                    r_gt = js["ground_truth_label"][idx]
+            p, r_, f = compute_pointwise_pre_rec_f1(round_label, r_gt, max_label)
+            iter_metrics[r+1]["pre"].append(p)
+            iter_metrics[r+1]["rec"].append(r_)
+            iter_metrics[r+1]["f1"].append(f)
+
+    if n_total == 0:
+        return 0, 0, 0, 0, {}
+
+    final = (100*sum(pres)/n_total, 100*sum(recs)/n_total, 100*sum(f1s)/n_total, n_total)
+    iters = {}
+    for rnd in sorted(iter_metrics.keys()):
+        m = iter_metrics[rnd]
+        iters[rnd] = (100*sum(m["pre"])/len(m["pre"]),
+                      100*sum(m["rec"])/len(m["rec"]),
+                      100*sum(m["f1"])/len(m["f1"]))
+    return final + (iters,)
+
+
+def evaluate_item_ars(file_path, dataset, max_label=3):
+    """
+    ITEM-ARs (Steps 5-6)
+    LLM_output_all 是最终 0/1 列表
+    ground_truth_label 是 list of lists
+    """
+    return evaluate_item_as(file_path, dataset, max_label)
+
+
+def evaluate_item_ar(file_path, dataset, max_label=3):
+    """
+    ITEM-Ar (Step 7: utility ranking-based)
+    与 ITEM-As 结构相似，但有 utility_labels + model_out_labels（多轮）
+    """
+    pres, recs, f1s = [], [], []
+    iter_metrics = defaultdict(lambda: {"pre": [], "rec": [], "f1": []})
+    n_total = 0
+    for line in open(file_path, 'r', encoding='utf-8'):
+        js = json.loads(line)
+        final_label = js.get("LLM_output_all", [])
+        gt = js.get("ground_truth_label", [])
+        if isinstance(gt, list) and len(gt) > 0 and isinstance(gt[0], list):
+            gt = gt[-1]
+        pre, rec, f1 = compute_pointwise_pre_rec_f1(final_label, gt, max_label)
+        pres.append(pre)
+        recs.append(rec)
+        f1s.append(f1)
+        n_total += 1
+
+        # 逐轮
+        model_out_labels = js.get("model_out_labels", [])
+        utility_labels = js.get("utility_labels", [])
+        for r, round_label in enumerate(model_out_labels):
+            r_gt = utility_labels[min(r, len(utility_labels)-1)] if utility_labels else gt
+            if isinstance(r_gt, list) and len(r_gt) > 0 and isinstance(r_gt[0], list):
+                r_gt = r_gt[-1]
+            p, r_, f = compute_pointwise_pre_rec_f1(round_label, r_gt, max_label)
+            iter_metrics[r+1]["pre"].append(p)
+            iter_metrics[r+1]["rec"].append(r_)
+            iter_metrics[r+1]["f1"].append(f)
+
+    if n_total == 0:
+        return 0, 0, 0, 0, {}
+
+    final = (100*sum(pres)/n_total, 100*sum(recs)/n_total, 100*sum(f1s)/n_total, n_total)
+    iters = {}
+    for rnd in sorted(iter_metrics.keys()):
+        m = iter_metrics[rnd]
+        n = len(m["pre"])
+        iters[rnd] = (100*sum(m["pre"])/n, 100*sum(m["rec"])/n, 100*sum(m["f1"])/n) if n else (0,0,0)
+    return final + (iters,)
+
+
+def evaluate_k_sampling(file_path, max_label=3):
+    """
+    K-Sampling (Step 8)
+    特殊结构：all_selected_passages, selected_abels, ground_truth_label
+    """
+    pres, recs, f1s = [], [], []
+    n_total = 0
+    for line in open(file_path, 'r', encoding='utf-8'):
+        js = json.loads(line)
+        gt = js.get("ground_truth_label", [])
+        all_selected = js.get("all_selected_passages", [])
+        selected_labels = js.get("selected_abels", {})
+        if not all_selected:
+            continue
+        # 多数投票选择 passage
+        select_k = {}
+        nums_len = {}
+        for sel_set in all_selected[:6]:
+            if len(sel_set) in nums_len:
+                nums_len[len(sel_set)] += 1
+            else:
+                nums_len[len(sel_set)] = 1
+            for p in sel_set:
+                select_k[p] = select_k.get(p, 0) + 1
+        if not select_k:
+            continue
+        len_s = sorted(nums_len.items(), key=lambda x: x[1], reverse=True)
+        top_k = len_s[0][0]
+        selected_passages = sorted(select_k.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        selected = [p for p, _ in selected_passages]
+        # 检查 selected 中有多少是真正有用的
+        acc = sum(1 for p in selected if selected_labels.get(p, 0) == max_label)
+        gt_indices = [i for i, lbl in enumerate(gt) if lbl >= max_label]
+        pre = acc / len(selected) if selected else 0
+        rec = acc / len(gt_indices) if gt_indices else 0
+        f1 = 2 * pre * rec / (pre + rec) if (pre + rec) > 0 else 0
+        pres.append(pre)
+        recs.append(rec)
+        f1s.append(f1)
+        n_total += 1
+    if n_total == 0:
+        return 0, 0, 0, 0
+    return (100*sum(pres)/n_total, 100*sum(recs)/n_total, 100*sum(f1s)/n_total, n_total)
+
+
+# ── 主流程 ──────────────────────────────────────────────
+
+def main():
+    wb = Workbook()
+    # 删除默认空 sheet
+    wb.remove(wb.active)
+
+    # ====== Sheet 1: Single-Shot Baselines ======
+    ws1 = wb.create_sheet("1_SingleShot_Baselines")
+    ws1.append(["Experiment", "Dataset", "Variant", "Precision", "Recall", "F1", "Samples"])
+
+    single_shot_files = [
+        ("Vanilla-Listwise",   "level2_update_oral_dense/{ds}/{ds}-directly-list-11.json"),
+        ("Vanilla-Pointwise",  "level2_update_oral_dense/{ds}/{ds}-directly-point-01.json"),
+        ("UJ-ExpA-Listwise",   "level2_update_oral_dense/{ds}/{ds}-directly-list-answer-passages-11.json"),
+        ("UJ-ExpA-Pointwise",  "level2_update_oral_dense/{ds}/{ds}-directly-point-answer-passage-01.json"),
+        ("UJ-ImpA-Listwise",   "level2_update_oral_dense/{ds}/{ds}-directly-list-answer-cot-passages3-11.json"),
+        ("UJ-ImpA-Pointwise",  "level2_update_oral_dense/{ds}/{ds}-directly-point-answer-cot-passage3-01.json"),
+    ]
+
+    for variant, path_tpl in single_shot_files:
+        for ds in ["trec", "webap"]:
+            path = path_tpl.format(ds=ds)
+            if os.path.exists(path):
+                pre, rec, f1, n = evaluate_single_shot(path, max_label=3)
+                ws1.append([f"{variant} {ds.upper()}", ds.upper(), variant,
+                           f"{pre:.2f}", f"{rec:.2f}", f"{f1:.2f}", n])
+                print(f"[SingleShot] {variant:25s} {ds:6s}  P={pre:.2f}  R={rec:.2f}  F1={f1:.2f}  N={n}")
+            else:
+                print(f"[SKIP] {path} not found")
+
+    # ====== Sheet 2: ITEM-As (ExpA) ======
+    ws2 = wb.create_sheet("2_ITEM-As_ExpA")
+    ws2.append(["Experiment", "Dataset", "Mode", "Precision", "Recall", "F1", "Samples"])
+
+    item_as_files = [
+        ("ITEM-As-TREC",   "trec-code/level4/trec/listwise/trec-iter-passages-list88-0final--10.json", "listwise"),
+        ("ITEM-As-TREC",   "trec-code/level4/trec/pointwise/trec-iter-passages-point-add-ref88-0final--10.json", "pointwise"),
+        ("ITEM-As-WebAP",  "trec-code/level4/webap/listwise/webap-iter-passages-list88-0final--10.json", "listwise"),
+        ("ITEM-As-WebAP",  "trec-code/level4/webap/pointwise/webap-iter-passages-point-add-ref88-0final--10.json", "pointwise"),
+        # no-ref variants
+        ("ITEM-As-WebAP",  "trec-code/level4/webap/listwise/webap-iter-passages-list-no-ref8-0final--10.json", "listwise-no-ref"),
+        ("ITEM-As-WebAP",  "trec-code/level4/webap/pointwise/webap-iter-passages-point-add-ref-0final--10.json", "pointwise-no-ref"),
+    ]
+
+    for exp_name, path, mode in item_as_files:
+        if os.path.exists(path):
+            pre, rec, f1, n, iters = evaluate_item_as(path, "", 3)
+            ws2.append([exp_name, exp_name.split("-")[-1], mode,
+                       f"{pre:.2f}", f"{rec:.2f}", f"{f1:.2f}", n])
+            print(f"[ITEM-As]  {exp_name:20s} {mode:20s}  P={pre:.2f}  R={rec:.2f}  F1={f1:.2f}  N={n}")
+        else:
+            print(f"[SKIP] {path} not found")
+
+    # ====== Sheet 3: ITEM-As-ImpA (CoT) ======
+    ws3 = wb.create_sheet("3_ITEM-As-ImpA")
+    ws3.append(["Experiment", "Dataset", "Mode", "Precision", "Recall", "F1", "Samples"])
+
+    impa_files = [
+        ("ITEM-As-ImpA-TREC",  "trec-code/level4_cot/trec/listwise/trec-note-iter-passages-listfianl13--1.json", "listwise"),
+        ("ITEM-As-ImpA-TREC",  "trec-code/level4_cot/trec/pointwise/trec-new-iter-passages-pointfinal14--1.json", "pointwise"),
+        ("ITEM-As-ImpA-WebAP", "trec-code/level4_cot/webap/listwise/webap-note-iter-passages-listfinal13--1.json", "listwise"),
+        ("ITEM-As-ImpA-WebAP", "trec-code/level4_cot/webap/pointwise/webap-new-iter-passages-pointfinal14--1.json", "pointwise"),
+    ]
+
+    for exp_name, path, mode in impa_files:
+        if os.path.exists(path):
+            pre, rec, f1, n, iters = evaluate_item_as(path, "", 3)
+            ws3.append([exp_name, exp_name.split("-")[-1], mode,
+                       f"{pre:.2f}", f"{rec:.2f}", f"{f1:.2f}", n])
+            print(f"[ImpA]     {exp_name:20s} {mode:20s}  P={pre:.2f}  R={rec:.2f}  F1={f1:.2f}  N={n}")
+        else:
+            print(f"[SKIP] {path} not found")
+
+    # ====== Sheet 4: ITEM-ARs ======
+    ws4 = wb.create_sheet("4_ITEM-ARs")
+    ws4.append(["Experiment", "Dataset", "Precision", "Recall", "F1", "Samples"])
+
+    ars_files = [
+        ("ITEM-ARs-TREC",  "level4_relevance_upedate/trec/listwise/trec-iter-merge2-0final--10.json"),
+        ("ITEM-ARs-WebAP", "level4_relevance_upedate/webap/listwise/webap-iter-passages-list-relevance-realinitialsort-0final--10.json"),
+    ]
+
+    for exp_name, path in ars_files:
+        if os.path.exists(path):
+            pre, rec, f1, n, iters = evaluate_item_ars(path, "", 3)
+            ws4.append([exp_name, exp_name.split("-")[-1],
+                       f"{pre:.2f}", f"{rec:.2f}", f"{f1:.2f}", n])
+            print(f"[ITEM-ARs] {exp_name:20s}  P={pre:.2f}  R={rec:.2f}  F1={f1:.2f}  N={n}")
+        else:
+            print(f"[SKIP] {path} not found")
+
+    # ====== Sheet 5: ITEM-Ar ======
+    ws5 = wb.create_sheet("5_ITEM-Ar")
+    ws5.append(["Experiment", "Dataset", "Precision", "Recall", "F1", "Samples"])
+
+    ar_files = [
+        ("ITEM-Ar-TREC", "trec-code/level4_utility_ranking/trec/listwise/trec-iter-passages-list-new-no-def-final-0final--110.json"),
+    ]
+
+    for exp_name, path in ar_files:
+        if os.path.exists(path):
+            pre, rec, f1, n, iters = evaluate_item_ar(path, "", 3)
+            ws5.append([exp_name, exp_name.split("-")[-1],
+                       f"{pre:.2f}", f"{rec:.2f}", f"{f1:.2f}", n])
+            print(f"[ITEM-Ar]  {exp_name:20s}  P={pre:.2f}  R={rec:.2f}  F1={f1:.2f}  N={n}")
+        else:
+            print(f"[SKIP] {path} not found")
+
+    # ====== Sheet 6: K-Sampling ======
+    ws6 = wb.create_sheet("6_K-Sampling")
+    ws6.append(["Experiment", "Dataset", "Precision", "Recall", "F1", "Samples"])
+
+    ks_files = [
+        ("K-Sampling-TREC",  "results/Qwen3-8B-no-thinking/trec-k-sampling-.json"),
+        ("K-Sampling-WebAP", "results/Qwen3-8B-no-thinking/webap-k-sampling-.json"),
+    ]
+
+    for exp_name, path in ks_files:
+        if os.path.exists(path):
+            pre, rec, f1, n = evaluate_k_sampling(path, 3)
+            ws6.append([exp_name, exp_name.split("-")[-1],
+                       f"{pre:.2f}", f"{rec:.2f}", f"{f1:.2f}", n])
+            print(f"[K-Samp]   {exp_name:20s}  P={pre:.2f}  R={rec:.2f}  F1={f1:.2f}  N={n}")
+        else:
+            print(f"[SKIP] {path} not found")
+
+    # ====== Sheet 7: Iterative Convergence ======
+    ws7 = wb.create_sheet("7_Iterative_Details")
+    ws7.append(["Experiment", "Dataset", "Mode", "Round", "Precision", "Recall", "F1"])
+
+    # ITEM-As TREC listwise
+    for path, exp, ds, mode in [
+        ("trec-code/level4/trec/listwise/trec-iter-passages-list88-0final--10.json",  "ITEM-As", "TREC", "listwise"),
+        ("trec-code/level4/trec/pointwise/trec-iter-passages-point-add-ref88-0final--10.json", "ITEM-As", "TREC", "pointwise"),
+        ("trec-code/level4/webap/listwise/webap-iter-passages-list88-0final--10.json", "ITEM-As", "WebAP", "listwise"),
+        ("trec-code/level4/webap/pointwise/webap-iter-passages-point-add-ref88-0final--10.json", "ITEM-As", "WebAP", "pointwise"),
+        ("level4_relevance_upedate/trec/listwise/trec-iter-merge2-0final--10.json", "ITEM-ARs", "TREC", "listwise"),
+        ("level4_relevance_upedate/webap/listwise/webap-iter-passages-list-relevance-realinitialsort-0final--10.json", "ITEM-ARs", "WebAP", "listwise"),
+        ("trec-code/level4_utility_ranking/trec/listwise/trec-iter-passages-list-new-no-def-final-0final--110.json", "ITEM-Ar", "TREC", "listwise"),
+    ]:
+        if not os.path.exists(path):
+            continue
+        if "ITEM-Ar" in exp:
+            _, _, _, _, iters = evaluate_item_ar(path, "", 3)
+        else:
+            _, _, _, _, iters = evaluate_item_as(path, "", 3)
+        for rnd in sorted(iters.keys()):
+            p, r, f = iters[rnd]
+            ws7.append([exp, ds, mode, rnd, f"{p:.2f}", f"{r:.2f}", f"{f:.2f}"])
+            print(f"[Iter]     {exp:10s} {ds:6s} {mode:14s}  r{rnd}: P={p:.2f}  R={r:.2f}  F1={f:.2f}")
+
+    # ====== 保存 ======
+    out_path = "metrics/evaluation_results.xlsx"
+    wb.save(out_path)
+    print(f"\n{'='*60}")
+    print(f"结果已保存到 {out_path}")
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,8 @@
+1|Single-shot Baselines (TREC+WebAP)|OK|2026-06-26 11:36:51|mistral/single-shot-utility-judgmentspy.py
+2|ITEM-As TREC ExpA (listwise+pointwise)|OK|2026-06-26 11:52:12|llama3/item-As-ExpA.py
+3|ITEM-As WebAP ExpA|OK|2026-06-26 12:02:58|mistral/webap-item-As-ExpA.py
+4|ITEM-As-ImpA (TREC+WebAP)|OK|2026-06-26 12:13:11|mistral/item-As-ImpA.py
+5|ITEM-ARs TREC|OK|2026-06-26 12:16:00|mistral/TREC-item-ARs.py
+6|ITEM-ARs WebAP|OK|2026-06-26 12:39:08|mistral/webap-item-ARs.py
+7|ITEM-Ar TREC (utility ranking)|OK|2026-06-26 12:42:38|mistral/trec-item-Ar.py
+8|K-Sampling (TREC+WebAP)|OK|2026-06-26 12:43:26|mistral/k-sampling.py
